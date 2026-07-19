@@ -2,8 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
+import 'notification_service.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.initialize();
   runApp(const MyApp());
 }
 
@@ -44,6 +47,9 @@ class _TrackerPageState extends State<TrackerPage> {
   DateTime? _startDate;
   List<DateTime> _doses = [];
   bool _loading = true;
+  DateTime? _mockNow;
+
+  DateTime get _now => _mockNow ?? DateTime.now();
 
   // Правила курса
   final Map<int, ScheduleRule> _schedule = {};
@@ -53,6 +59,7 @@ class _TrackerPageState extends State<TrackerPage> {
     super.initState();
     _initSchedule();
     _loadData();
+    NotificationService.requestNotificationPermission();
   }
 
   void _initSchedule() {
@@ -86,9 +93,40 @@ class _TrackerPageState extends State<TrackerPage> {
       }
       _loading = false;
     });
+
+    if (_startDate != null) {
+      await _scheduleNextNotification();
+    }
   }
 
   Future<void> _startCourse() async {
+    final bool? proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Точные напоминания'),
+        content: const Text(
+          'Чтобы получать уведомления о приеме таблеток вовремя, '
+          'приложению требуется доступ к точным будильникам. \n\n'
+          'Пожалуйста, в открывшемся системном окне настроек разрешите '
+          'приложению "Доступ к точным будильникам".',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Позже (неточно)'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Перейти к настройкам'),
+          ),
+        ],
+      ),
+    );
+
+    if (proceed == true) {
+      await NotificationService.requestExactAlarmsPermission();
+    }
+
     final now = DateTime.now();
     setState(() {
       _startDate = now;
@@ -97,6 +135,7 @@ class _TrackerPageState extends State<TrackerPage> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('course_start_date', now.toIso8601String());
     await prefs.setStringList('doses_log', []);
+    _scheduleNextNotification();
   }
 
   Future<void> _stopCourse() async {
@@ -120,6 +159,7 @@ class _TrackerPageState extends State<TrackerPage> {
         _startDate = null;
         _doses = [];
       });
+      await NotificationService.cancelAll();
     }
   }
 
@@ -130,30 +170,57 @@ class _TrackerPageState extends State<TrackerPage> {
     });
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('doses_log', _doses.map((e) => e.toIso8601String()).toList());
+    _scheduleNextNotification();
+  }
+
+  Future<void> _scheduleNextNotification() async {
+    try {
+      await NotificationService.cancelAll();
+      final currentDay = _getCurrentDay();
+      final nextTime = _getNextDoseTime(currentDay);
+
+      if (nextTime != null) {
+        await NotificationService.scheduleNotification(
+          id: 0,
+          scheduledTime: nextTime,
+          title: 'Время принять таблетку',
+          body: 'Пора принять очередную таблетку Цитизина по схеме.',
+        );
+      }
+    } catch (e, stackTrace) {
+      debugPrint('Ошибка при планировании уведомлений: $e\n$stackTrace');
+    }
   }
 
   int _getCurrentDay() {
     if (_startDate == null) return 0;
-    final now = DateTime.now();
-    final diff = now.difference(_startDate!);
-    return diff.inDays + 1;
+    final now = _now;
+    final startMidnight = DateTime(_startDate!.year, _startDate!.month, _startDate!.day);
+    final nowMidnight = DateTime(now.year, now.month, now.day);
+    final diff = nowMidnight.difference(startMidnight);
+    final day = diff.inDays + 1;
+    return day < 1 ? 1 : day;
   }
 
   List<DateTime> _getDosesForDay(int day) {
     if (_startDate == null) return [];
-    // Начало этого дня курса
-    final dayStart = _startDate!.add(Duration(days: day - 1));
-    // Конец этого дня (начало следующего)
-    final dayEnd = dayStart.add(const Duration(days: 1));
-    
-    // Ищем дозы, которые попали в этот интервал времени (абсолютный)
-    // Но для простоты часто считают календарные дни. 
-    // Здесь будем считать календарные дни от старта.
     
     return _doses.where((d) {
-       final doseDay = d.difference(_startDate!).inDays + 1;
+       final startMidnight = DateTime(_startDate!.year, _startDate!.month, _startDate!.day);
+       final doseMidnight = DateTime(d.year, d.month, d.day);
+       final doseDay = doseMidnight.difference(startMidnight).inDays + 1;
        return doseDay == day;
     }).toList();
+  }
+
+  DateTime _adjustForNightTime(DateTime time) {
+    if (time.hour >= 22) {
+      final nextDay = time.add(const Duration(days: 1));
+      return DateTime(nextDay.year, nextDay.month, nextDay.day, 8, 0);
+    } else if (time.hour < 8) {
+      return DateTime(time.year, time.month, time.day, 8, 0);
+    }
+    return time;
   }
 
   DateTime? _getNextDoseTime(int currentDay) {
@@ -163,15 +230,56 @@ class _TrackerPageState extends State<TrackerPage> {
     if (rule.interval.inMinutes == 0) return null; // Ручной режим
 
     final todayDoses = _getDosesForDay(currentDay);
-    if (todayDoses.isEmpty) return DateTime.now(); // Если сегодня еще не пили - пей сейчас
+    
+    // Если на сегодня лимит исчерпан
+    if (todayDoses.length >= rule.maxDoses) {
+      if (currentDay < 25) {
+        // Следующий день курса начинается в полночь следующего дня
+        final startMidnight = DateTime(_startDate!.year, _startDate!.month, _startDate!.day);
+        final nextDayMidnight = startMidnight.add(Duration(days: currentDay));
+        return _adjustForNightTime(nextDayMidnight);
+      }
+      return null; // Курс завершен
+    }
 
-    // Сортируем, берем последнюю
+    if (todayDoses.isEmpty) {
+      final now = _now;
+      final morningTime = DateTime(now.year, now.month, now.day, 8, 0);
+      if (now.isBefore(morningTime)) {
+        return morningTime;
+      }
+      return now;
+    }
+
     todayDoses.sort();
     final lastDose = todayDoses.last;
     
-    // Следующая = последняя + интервал
-    return lastDose.add(rule.interval);
+    final rawNextTime = lastDose.add(rule.interval);
+    return _adjustForNightTime(rawNextTime);
   }
+
+  @visibleForTesting
+  void setTestState(DateTime start, List<DateTime> doses) {
+    _startDate = start;
+    _doses = doses;
+  }
+
+  @visibleForTesting
+  void setMockNow(DateTime mockTime) {
+    _mockNow = mockTime;
+  }
+
+  @visibleForTesting
+  int getCurrentDayTest() => _getCurrentDay();
+
+  @visibleForTesting
+  List<DateTime> getDosesForDayTest(int day) => _getDosesForDay(day);
+
+  @visibleForTesting
+  DateTime adjustForNightTimeTest(DateTime time) => _adjustForNightTime(time);
+
+  @visibleForTesting
+  DateTime? getNextDoseTimeTest(int currentDay) => _getNextDoseTime(currentDay);
 
   @override
   Widget build(BuildContext context) {
@@ -205,7 +313,6 @@ class _TrackerPageState extends State<TrackerPage> {
     }
 
     final currentDay = _getCurrentDay();
-    final isFinished = currentDay > 25;
 
     return Scaffold(
       appBar: AppBar(
@@ -266,12 +373,19 @@ class _TrackerPageState extends State<TrackerPage> {
     String timerText = "Можно принять";
     Color timerColor = Colors.green;
 
-    if (nextTime != null && nextTime.isAfter(DateTime.now())) {
-      timerText = DateFormat('HH:mm').format(nextTime);
-      timerColor = Colors.orange;
-    } else if (count >= rule.maxDoses) {
+    if (count >= rule.maxDoses) {
       timerText = "На сегодня всё";
       timerColor = Colors.grey;
+    } else if (dosesToday.isEmpty) {
+      timerText = "Можно принять";
+      timerColor = Colors.green;
+    } else if (nextTime != null && nextTime.isAfter(_now)) {
+      if (nextTime.day != _now.day) {
+        timerText = DateFormat('Завтра в HH:mm').format(nextTime);
+      } else {
+        timerText = DateFormat('HH:mm').format(nextTime);
+      }
+      timerColor = Colors.orange;
     }
 
     return Container(
@@ -279,6 +393,7 @@ class _TrackerPageState extends State<TrackerPage> {
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
+        // ignore: deprecated_member_use
         boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)],
       ),
       child: Column(
@@ -299,8 +414,8 @@ class _TrackerPageState extends State<TrackerPage> {
               width: double.infinity,
               height: 50,
               child: ElevatedButton.icon(
-                onPressed: (nextTime != null && nextTime.isAfter(DateTime.now())) 
-                    ? null // Кнопка неактивна, если рано
+                onPressed: (nextTime != null && nextTime.isAfter(_now) && dosesToday.isNotEmpty) 
+                    ? null // Кнопка неактивна, если рано и уже были приемы сегодня
                     : _takePill,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.teal,
@@ -310,11 +425,35 @@ class _TrackerPageState extends State<TrackerPage> {
                 label: const Text("ПРИНЯТЬ ТАБЛЕТКУ"),
               ),
             ),
-             if (nextTime != null && nextTime.isAfter(DateTime.now()))
+             if (nextTime != null && nextTime.isAfter(_now) && dosesToday.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 8.0),
                 child: Text("Ждите времени приема...", style: TextStyle(color: Colors.orange[800], fontSize: 12)),
-              )
+              ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              height: 40,
+              child: OutlinedButton.icon(
+                onPressed: () async {
+                  await NotificationService.scheduleNotification(
+                    id: 999,
+                    scheduledTime: DateTime.now().add(const Duration(seconds: 3)),
+                    title: 'Тест уведомлений',
+                    body: 'Уведомления на Android 14 работают отлично! 🚀',
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Уведомление придет через 3 секунды. Закройте приложение для проверки!')),
+                  );
+                },
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.blueGrey,
+                  side: const BorderSide(color: Colors.blueGrey),
+                ),
+                icon: const Icon(Icons.notification_important),
+                label: const Text("ТЕСТ УВЕДОМЛЕНИЯ (3 сек)"),
+              ),
+            ),
         ],
       ),
     );
